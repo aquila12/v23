@@ -4,7 +4,7 @@
 #include <cmath>
 #include <unistd.h>
 
-#define SAMPLERATE      44100
+#define DEF_SAMPLE_RATE 44100
 #define F_MARK_FREQ     1300
 #define F_SPACE_FREQ    2100
 #define B_MARK_FREQ     390
@@ -527,6 +527,7 @@ int main(int argc, char* argv[])
     char errchar = 0;       // No output for errors
     const char *frame_format = DEF_FRAME_FORMAT;
     modemcfg modem;
+    int sample_rate = DEF_SAMPLE_RATE;
     
     // Process args
     for(int i=0; i<argc; ++i)
@@ -564,6 +565,10 @@ int main(int argc, char* argv[])
                 case 'q':   // Quiet mode
                     ++quiet;
                     break;
+                case 'r':   // Sample Rate
+                    sscanf(&arg[2],"%d",&sample_rate);
+                    fprintf(stderr, "Set sample rate to %d\n", sample_rate);
+                    break;
                 case 'e':   // Character to output for parity errors
                     errchar = arg[2];
                     break;
@@ -579,7 +584,7 @@ int main(int argc, char* argv[])
     }
     
     // Set up a the sine buffer
-    if(!sin_init(SAMPLERATE)) {
+    if(!sin_init(sample_rate)) {
         fprintf(stderr, "Failed to initialize sine buffer\n");
         exit(1);
     }
@@ -591,9 +596,9 @@ int main(int argc, char* argv[])
     }
     
     if(forward)
-        init_modemcfg(modem, F_MARK_FREQ, F_SPACE_FREQ, SAMPLERATE, F_BIT_RATE, SKEW_LIMIT);
+        init_modemcfg(modem, F_MARK_FREQ, F_SPACE_FREQ, sample_rate, F_BIT_RATE, SKEW_LIMIT);
     else
-        init_modemcfg(modem, B_MARK_FREQ, B_SPACE_FREQ, SAMPLERATE, B_BIT_RATE, SKEW_LIMIT);
+        init_modemcfg(modem, B_MARK_FREQ, B_SPACE_FREQ, sample_rate, B_BIT_RATE, SKEW_LIMIT);
   
     if(!quiet)
     {
