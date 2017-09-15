@@ -13,11 +13,12 @@
 #define F_BIT_RATE      1200
 #define B_BIT_RATE      75
 
-#define MAX_SKEW        5
+#define SKEW_LIMIT      0.2
 
 #define DEF_FRAME_FORMAT    "10dddddddp1"
-#define FRAME_LSB_FIRST 1
-#define FRAME_OVERLAP   1
+
+int quiet=0;
+int debug=0;
 
 struct maf {
   int16_t *buf;
@@ -31,6 +32,28 @@ struct osc {
   int p;
 };
 
+struct framefmt {
+    int frame_size; // Overall size of a frame
+    int32_t frame_pattern;  // Pattern to look for, including previous idle / stop bit
+    int32_t frame_mask;     // Mask to apply before checking for pattern
+    int32_t parity_mask;    // Mask to apply to find parity bit
+    bool parity_enable;     // Check parity at all ?
+    bool parity_even;       // Set to use even rather than odd parity
+    int data_offset;        // Number of bits after data
+    int data_mask;          // Mark to apply to get data bits
+    int data_size;          // Total number of data bits
+    bool lsb_first;         // Does lsb come first or last (endianism)
+};
+
+struct modemcfg {
+    int mark_freqhz;
+    int space_freqhz;
+    framefmt ff;
+    int samples_per_bit;
+    int max_skew;
+    char errchar;
+};
+
 int16_t *sinebuf;
 size_t sinelen;
 
@@ -39,7 +62,7 @@ int16_t* make_buffer(size_t N)
   return (int16_t*)calloc(N, sizeof(int16_t));
 }
 
-bool sine_init(size_t N)
+bool sin_init(size_t N)
 {
   sinebuf = make_buffer(N);
   if(!sinebuf) return false;
@@ -194,6 +217,7 @@ size_t get_input_samples(int16_t *buf, size_t n) {
   return read(0, (char*)buf, n * sizeof(int16_t)) / sizeof(int16_t);
 }
 
+// Parity of some data - returns true if an odd number of bits are set
 bool parity(unsigned int v){
     // http://graphics.stanford.edu/~seander/bithacks.html#ParityWith64Bits
     v ^= v >> 1;
@@ -202,13 +226,307 @@ bool parity(unsigned int v){
     return ((v >> 28) & 1 != 0);
 }
 
+// Note: Overlap of 1 allows checking for previous stop / idle bit
+bool init_framefmt(framefmt& ff, const char* fmt, int overlap)
+{
+    // Set up frame constants
+    ff.frame_pattern = 0;
+    ff.frame_mask    = 0;
+    ff.parity_mask   = 0;
+    ff.parity_enable = false;
+    ff.parity_even   = false;
+    ff.data_offset = 0;
+    ff.data_mask  = 0;
+    ff.data_size  = 0;
+    ff.frame_size = -overlap;
+    ff.lsb_first  = true;
+    for(size_t i=0; fmt[i] != '\0'; ++i)
+    {
+        char c = fmt[i];
+        ff.frame_mask    <<= 1;
+        ff.frame_pattern <<= 1;
+        ff.parity_mask   <<= 1;
+        ff.data_mask     <<= 1;
+        ++ff.data_offset;
+        ++ff.frame_size;
+        
+        switch(c)
+        {
+            case '1':
+                ff.frame_mask    |= 1;
+                ff.frame_pattern |= 1;
+                break;
+            case '0':
+                ff.frame_mask    |= 1;
+                ff.frame_pattern |= 0;
+                break;
+            case 'd':
+            case 'D':
+                ff.data_mask   |= 1;
+                ff.data_offset = 0;
+                ++ff.data_size;
+                ff.lsb_first = (c == 'd');
+                break;
+            case 'p':
+            case 'P':
+                ff.parity_mask   |= 1;
+                ff.parity_enable = true;
+                ff.parity_even = (c == 'P');
+                break;
+            default:
+                fprintf(stderr, "Invalid frame format specifier in %s: %c\n", fmt, c);
+                return false;
+        }
+    }
+    
+    return true;
+}
+
+void init_modemcfg(modemcfg& m, int mark, int space, int samplerate, int baudrate, float skew_limit) {
+    m.mark_freqhz     = mark;
+    m.space_freqhz    = space;
+    m.samples_per_bit = samplerate / baudrate;
+    m.max_skew        = (float)samplerate * skew_limit / (float)baudrate;
+    m.errchar         = 0;
+}
+
+void v23_demodulate(modemcfg& m) {
+    framefmt& f = m.ff;
+    // Local mark / space demodulation oscillators
+    osc oscMarkIn, oscSpaceIn;
+    oscMarkIn.p = 0;
+    oscSpaceIn.p = 0;
+    oscMarkIn.freqhz  = m.mark_freqhz;
+    oscSpaceIn.freqhz = m.space_freqhz;
+  
+    // Working registers
+    int16_t *bufIn, *bufOut;
+    int16_t *bufWork;
+    int16_t *bufI, *bufQ;
+    int16_t *bufMark, *bufSpace;
+    int32_t out_shift = -1; // Raw serial shift-register
+    int frame_hold = 50;    // How many bits to hold off for - preset to stabilize the MAFs
+    
+    // Quality monitoring
+    int num_transitions = 0;
+    int total_skew_correction = 0;
+    
+    maf mafMarkI, mafMarkQ, mafSpaceI, mafSpaceQ, mafOut, mafBit;
+    size_t N = 1024; // Maximum samples we can take at once
+    
+    size_t bit_wait = m.samples_per_bit;  // Samples left until we read a bit
+    
+    // Set up the moving average filters
+    if(! (
+        maf_init(mafMarkI,  m.samples_per_bit) &&
+        maf_init(mafMarkQ,  m.samples_per_bit) &&
+        maf_init(mafSpaceI, m.samples_per_bit) &&
+        maf_init(mafSpaceQ, m.samples_per_bit) &&
+        maf_init(mafOut,    m.samples_per_bit) &&
+        maf_init(mafBit,    m.samples_per_bit) )) {
+        
+        fprintf(stderr, "Failed to initialize MAFs\n");
+        exit(1);
+    }
+    
+    bufIn    = make_buffer(N);
+    bufOut   = make_buffer(N);
+    bufWork  = make_buffer(N);
+    bufI     = make_buffer(N);
+    bufQ     = make_buffer(N);
+    bufMark  = make_buffer(N);
+    bufSpace = make_buffer(N);
+  
+    if(!( bufIn && bufOut && bufWork && bufI && bufQ && bufMark && bufSpace))
+    {
+        fprintf(stderr, "Failed to allocate buffers\n");
+        exit(1);
+    }
+    
+    if(!quiet)
+        fprintf(stderr, "Initialized.  Processing samples.\n");
+
+    size_t n;     // Number of samples we have this time
+    int state=0;  // What was the last state
+    while(n = get_input_samples(bufIn, N))
+    {
+        //printf("Got %d of %d samples...\n", n, N);
+        // Mix and filter the Mark oscillator
+        osc_get_complex_samples(oscMarkIn, bufI, bufQ, n);
+        mul_samples(bufIn, bufI, bufWork, n);
+        maf_process(mafMarkI, bufWork, bufI, n);
+        mul_samples(bufIn, bufQ, bufWork, n);
+        maf_process(mafMarkQ, bufWork, bufQ, n);
+        mag_complex_samples(bufI, bufQ, bufMark, n);
+
+        // Mix and filter the Space oscillator
+        osc_get_complex_samples(oscSpaceIn, bufI, bufQ, n);
+        mul_samples(bufIn, bufI, bufWork, n);
+        maf_process(mafSpaceI, bufWork, bufI, n);
+        mul_samples(bufIn, bufQ, bufWork, n);
+        maf_process(mafSpaceQ, bufWork, bufQ, n);
+        mag_complex_samples(bufI, bufQ, bufSpace, n);
+
+        // Subtract the magnitudes and feed output MAF
+        sub_samples(bufMark, bufSpace, bufWork, n);
+        maf_process(mafOut, bufWork, bufOut, n);
+        
+        // Bit sampling
+        sgn_samples(bufOut, bufWork, n);
+        maf_process(mafBit, bufWork, bufOut, n, true);
+        
+        // Run through the output samples
+        int last;
+        for(size_t i=0; i<n; ++i)
+        {
+            last = state;
+            state = (bufOut[i] > 0);
+            
+            // Edge detected - re-align
+            if(last != state) {
+                int adj = (m.samples_per_bit / 2) - bit_wait;
+                if(debug > 1)
+                    fprintf(stderr, "Realigned by %d samples\n", adj);
+                
+                bit_wait = m.samples_per_bit / 2;
+                
+                // Don't count the first correction
+                if(num_transitions > 0)
+                    total_skew_correction += (adj >= 0) ? adj : -adj;
+                ++num_transitions;
+            }
+            
+            // If the shift register is all ones or all zeros, dump the skew counter 
+            if(out_shift == -1 || out_shift == 0)
+            {
+                total_skew_correction = 0;
+                num_transitions = 0;
+                if(debug > 3)
+                    fprintf(stderr, "Line idle (%04x)\n", out_shift);
+            }
+            
+            if(--bit_wait <= 0)
+            {
+                if(debug > 2)
+                    fprintf(stderr, "Read bit '%d'\n", state);
+                out_shift <<= 1;
+                out_shift += state;
+                
+                if(frame_hold > 0)                                  // Frame Hold-off
+                {
+                    --frame_hold;
+                    if(debug > 2)
+                        fprintf(stderr, "Frame hold (%d left)\n", frame_hold);
+                }
+                else if((out_shift & f.frame_mask) == f.frame_pattern)    // Frame is valid
+                {
+                    // Start of the frame doesn't get counted
+                    --num_transitions;
+                    
+                    // Check the quality
+                    if(num_transitions == 0)
+                        fprintf(stderr, "Dropping frame with no transitions!\n");
+                    else
+                    {
+                        int avg_skew = total_skew_correction / num_transitions;
+                        
+                        // Reset counters
+                        total_skew_correction = 0;
+                        num_transitions = 0;
+                        frame_hold = f.frame_size - 1;
+                        
+                        if(avg_skew > m.max_skew)
+                        {
+                            if(debug > 1)
+                                fprintf(stderr, "Dropping frame with high skew of %d\n", avg_skew);
+                        }
+                        else
+                        {
+                            int32_t frame_data = out_shift & ((1 << f.frame_size) - 1);
+                            if(debug > 1)
+                                fprintf(stderr, "Processing frame: 0x%x, skew %d\n",
+                                        frame_data, avg_skew);
+                            
+                            bool parity_bit = (frame_data & f.parity_mask) != 0;
+                            uint32_t data =   (frame_data & f.data_mask  ) >> f.data_offset;
+                            bool data_parity = parity(data);
+                            
+                            if(debug > 1)
+                                fprintf(stderr, "Data: 0x%02x Parity: %c Data parity: %c\n", (int)data,
+                                    parity_bit ? '1' : '0', data_parity ? '1' : '0'
+                                );
+                            
+                            // Check parity
+                            if(!f.parity_even) data_parity = !data_parity;
+                            
+                            // Parity check
+                            if(!f.parity_enable || (data_parity == parity_bit))
+                            {
+                                // All OK
+                                if(f.lsb_first)
+                                {
+                                    // Assume we're working with no more than 8 data bits!
+                                    data <<= (8 - f.data_size);
+                                    
+                                    // Reverse bits in byte (LSB is first transmitted)
+                                    // http://graphics.stanford.edu/~seander/bithacks.html#ReverseByteWith64BitsDiv
+                                    data = (data * 0x0202020202ULL & 0x010884422010ULL) % 1023;
+                                }
+                                
+                                data &= 0xff;
+                                
+                                if(debug > 1)
+                                    fprintf(stderr, "Got byte: 0x%02x\n", data);
+                                printf("%c", (char)data);
+                                fflush(stdout);
+                            }
+                            else
+                            {
+                                if(debug > 1)
+                                    fprintf(stderr, "Dropping frame with bad parity\n");
+                                if(m.errchar)
+                                {
+                                    printf("%c", m.errchar);
+                                    fflush(stdout);
+                                }
+                            }
+                        }
+                    }
+                }
+                else if(debug > 2)
+                    fprintf(stderr, "Waiting for a valid frame\n");
+                
+                bit_wait += m.samples_per_bit;
+            }
+        }
+    }
+    
+    free(bufIn);
+    free(bufOut);
+    free(bufWork);
+    free(bufI);
+    free(bufQ);
+    free(bufMark);
+    free(bufSpace);
+    free(mafMarkI.buf);
+    free(mafMarkQ.buf);
+    free(mafSpaceI.buf);
+    free(mafSpaceQ.buf);
+    free(mafOut.buf);
+    free(mafBit.buf);
+}
+
+void v23_modulate(modemcfg& m) {
+    // TODO: Implement
+};
+
 int main(int argc, char* argv[])
 {
-    bool d_forward = false;    // By default, input is the backward channel.
-    int debug = 0, quiet = 0;
-    char errchar = 0;   // No output for errors
+    bool demodulate = true; // By default, demodulate the backward channel.
+    bool forward = false;
+    char errchar = 0;       // No output for errors
     const char *frame_format = DEF_FRAME_FORMAT;
-    bool lsb_first = true;
+    modemcfg modem;
     
     // Process args
     for(int i=0; i<argc; ++i)
@@ -222,331 +540,83 @@ int main(int argc, char* argv[])
         case '-':   // Start of option
             switch(arg[1])
             {
-                case 'D':   // Set demodulation (input) channel
+                case 'c':   // Set channel
                     switch(arg[2]) {
-                        case 'f': d_forward = true; break;
-                        case 'b': d_forward = false; break;
+                        case 'f': forward = true; break;
+                        case 'b': forward = false; break;
                         default:
-                            fprintf(stderr, "Error: use -Df for forward or -Db for backward channel demodulation\n");
+                            fprintf(stderr, "Error: use -cf for forward or -cb for backward channel\n");
                             exit(1);
                     }
                     break;
-                case 'M':   // Set modulation (output) channel
+                case 'm':   // Set mode
+                    switch(arg[2]) {
+                        case 'm': demodulate = true; break;
+                        case 'd': demodulate = false; break;
+                        default:
+                            fprintf(stderr, "Error: use -mm to modulate or -md to demodulate\n");
+                            exit(1);
+                    }
                     break;
                 case 'd':   // Debugging output
                     ++debug;
                     break;
-                case 'q':
+                case 'q':   // Quiet mode
                     ++quiet;
                     break;
-                case 'e':
+                case 'e':   // Character to output for parity errors
                     errchar = arg[2];
                     break;
-                case 'f':
+                case 'f':   // Frame format specifier
                     frame_format = &arg[2];
                     break;
-                case 'E':   // Set endianism
-                    switch(arg[2]) {
-                        case 'l': lsb_first = true; break;
-                        case 'b': lsb_first = false; break;
-                        default:
-                            fprintf(stderr, "Error: use -El for lsb first or -Eb for msb first\n");
-                            exit(1);
-                    }
-                    break;
+                default:
+                    fprintf(stderr, "Unknown flag: %c\n", arg[1]);
+                    exit(1);
             }
             break;
         }
     }
     
     // Set up a the sine buffer
-    if(!sine_init(SAMPLERATE)) {
+    if(!sin_init(SAMPLERATE)) {
         fprintf(stderr, "Failed to initialize sine buffer\n");
         exit(1);
     }
     
-    // Set up frame constants
-    int32_t frame_pattern = 0;
-    int32_t frame_mask    = 0;
-    int32_t parity_mask   = 0;
-    bool parity_enable  = false;
-    bool parity_even    = false;
-    int data_offset = 0;
-    int data_mask  = 0;
-    int data_size  = 0;
-    int frame_size = -FRAME_OVERLAP;
-    for(size_t i=0; frame_format[i] != '\0'; ++i)
+    if( !init_framefmt(modem.ff, frame_format, 1) )
     {
-        char c = frame_format[i];
-        frame_mask    <<= 1;
-        frame_pattern <<= 1;
-        parity_mask   <<= 1;
-        data_mask     <<= 1;
-        ++data_offset;
-        ++frame_size;
-        
-        switch(c)
-        {
-            case '1':
-                frame_mask    |= 1;
-                frame_pattern |= 1;
-                break;
-            case '0':
-                frame_mask    |= 1;
-                frame_pattern |= 0;
-                break;
-            case 'd':
-                data_mask   |= 1;
-                data_offset = 0;
-                ++data_size;
-                break;
-            case 'p':
-                parity_mask   |= 1;
-                parity_enable = true;
-                parity_even = false;
-                break;
-            case 'P':
-                parity_mask   |= 1;
-                parity_enable = true;
-                parity_even = true;
-                break;
-            default:
-                fprintf(stderr, "Invalid frame format specifier: %c\n", c);
-        }
+        fprintf(stderr, "Failed to initialize frame format\n");
+        exit(1);
     }
-
-  // Set up some working constants
-  size_t bit_period_samples   = SAMPLERATE / ( d_forward ? F_BIT_RATE : B_BIT_RATE );
-  
-  // Local mark / space demodulation oscillators
-  osc oscMarkIn, oscSpaceIn;
-  oscMarkIn.p = 0;
-  oscSpaceIn.p = 0;
-  oscMarkIn.freqhz  = d_forward ? F_MARK_FREQ  : B_MARK_FREQ  ;
-  oscSpaceIn.freqhz = d_forward ? F_SPACE_FREQ : B_SPACE_FREQ ;
-  
-  if(!quiet)
-  {
-    fprintf(stderr, "Demodulating the %s channel\n", d_forward ? "FORWARD" : "BACKWARD");
-    fprintf(stderr, "Mark frequency:  %d Hz\n", oscMarkIn.freqhz);
-    fprintf(stderr, "Space frequency: %d Hz\n", oscSpaceIn.freqhz);
-    fprintf(stderr, "Bit period:   %d samples\n", bit_period_samples);
-    fprintf(stderr, "Frame size: %d, format %s\n", frame_size, frame_format);
-    fprintf(stderr, "Data size:  %d, %s first, with %s parity\n",
-            data_size, lsb_first ? "lsb":"msb", parity_enable ? (parity_even ? "even" : "odd" ) : "no");
-  }
-  
-  // Working registers
-  int16_t *bufIn, *bufOut;
-  int16_t *bufWork;
-  int16_t *bufI, *bufQ;
-  int16_t *bufMark, *bufSpace;
-  int32_t out_shift = -1; // Raw serial shift-register
-  int frame_hold = 50;    // How many bits to hold off for - preset to stabilize the MAFs
-  
-  // Quality monitoring
-  int num_transitions = 0;
-  int total_skew_correction = 0;
-  
-  maf mafMarkI, mafMarkQ, mafSpaceI, mafSpaceQ, mafOut, mafBit;
-  size_t N = 1024; // Maximum samples we can take at once
-  
-  size_t bit_wait = bit_period_samples;  // Samples left until we read a bit
-  
-  // Set up the moving average filters
-  if(! (
-    maf_init(mafMarkI,  bit_period_samples) &&
-    maf_init(mafMarkQ,  bit_period_samples) &&
-    maf_init(mafSpaceI, bit_period_samples) &&
-    maf_init(mafSpaceQ, bit_period_samples) &&
-    maf_init(mafOut,    bit_period_samples) &&
-    maf_init(mafBit,    bit_period_samples) )) {
     
-    fprintf(stderr, "Failed to initialize MAFs\n");
-    exit(1);
-  }
+    if(forward)
+        init_modemcfg(modem, F_MARK_FREQ, F_SPACE_FREQ, SAMPLERATE, F_BIT_RATE, SKEW_LIMIT);
+    else
+        init_modemcfg(modem, B_MARK_FREQ, B_SPACE_FREQ, SAMPLERATE, B_BIT_RATE, SKEW_LIMIT);
   
-  bufIn    = make_buffer(N);
-  bufOut   = make_buffer(N);
-  bufWork  = make_buffer(N);
-  bufI     = make_buffer(N);
-  bufQ     = make_buffer(N);
-  bufMark  = make_buffer(N);
-  bufSpace = make_buffer(N);
-  
-  if(!( bufIn && bufOut && bufWork && bufI && bufQ && bufMark && bufSpace))
-  {
-      fprintf(stderr, "Failed to allocate buffers\n");
-      exit(1);
-  }
-  
-  if(!quiet)
-    fprintf(stderr, "Initialized.  Processing samples.\n");
-
-  size_t n;     // Number of samples we have this time
-  int state=0;  // What was the last state
-  while(n = get_input_samples(bufIn, N))
-  {
-    //printf("Got %d of %d samples...\n", n, N);
-    // Mix and filter the Mark oscillator
-    osc_get_complex_samples(oscMarkIn, bufI, bufQ, n);
-    mul_samples(bufIn, bufI, bufWork, n);
-    maf_process(mafMarkI, bufWork, bufI, n);
-    mul_samples(bufIn, bufQ, bufWork, n);
-    maf_process(mafMarkQ, bufWork, bufQ, n);
-    mag_complex_samples(bufI, bufQ, bufMark, n);
-
-    // Mix and filter the Space oscillator
-    osc_get_complex_samples(oscSpaceIn, bufI, bufQ, n);
-    mul_samples(bufIn, bufI, bufWork, n);
-    maf_process(mafSpaceI, bufWork, bufI, n);
-    mul_samples(bufIn, bufQ, bufWork, n);
-    maf_process(mafSpaceQ, bufWork, bufQ, n);
-    mag_complex_samples(bufI, bufQ, bufSpace, n);
-
-    // Subtract the magnitudes and feed output MAF
-    sub_samples(bufMark, bufSpace, bufWork, n);
-    maf_process(mafOut, bufWork, bufOut, n);
-    
-    // Bit sampling
-    sgn_samples(bufOut, bufWork, n);
-    maf_process(mafBit, bufWork, bufOut, n, true);
-    
-    // Run through the output samples
-    int last;
-    for(size_t i=0; i<n; ++i)
+    if(!quiet)
     {
-        last = state;
-        state = (bufOut[i] > 0);
-        
-        // Edge detected - re-align
-        if(last != state) {
-            int adj = (bit_period_samples / 2) - bit_wait;
-            if(debug > 1)
-                fprintf(stderr, "Realigned by %d samples\n", adj);
-            
-            bit_wait = bit_period_samples / 2;
-            
-            total_skew_correction += (adj >= 0) ? adj : -adj;
-            ++num_transitions;
-        }
-        
-        // If the shift register is all ones or all zeros, dump the skew counter 
-        if(out_shift == -1 || out_shift == 0)
-        {
-            total_skew_correction = 0;
-            num_transitions = 0;
-            if(debug > 3)
-                fprintf(stderr, "Line idle (%04x)\n", out_shift);
-        }
-        
-        if(--bit_wait <= 0)
-        {
-            if(debug > 2)
-                fprintf(stderr, "Read bit '%d'\n", state);
-            out_shift <<= 1;
-            out_shift += state;
-            
-            if(frame_hold > 0)                                  // Frame Hold-off
-            {
-                --frame_hold;
-                if(debug > 2)
-                    fprintf(stderr, "Frame hold (%d left)\n", frame_hold);
-            }
-            else if((out_shift & frame_mask) == frame_pattern)    // Frame is valid
-            {
-                // Check the quality
-                if(num_transitions == 0)
-                    fprintf(stderr, "Dropping frame with no transitions!\n");
-                else
-                {
-                    int avg_skew = total_skew_correction / num_transitions;
-                    
-                    // Reset counters
-                    total_skew_correction = 0;
-                    num_transitions = 0;
-                    frame_hold = frame_size - 1;
-                    
-                    if(avg_skew > MAX_SKEW)
-                    {
-                        if(debug > 1)
-                            fprintf(stderr, "Dropping frame with high skew of %d\n", avg_skew);
-                    }
-                    else
-                    {
-                        int32_t frame_data = out_shift & ((1<<frame_size) - 1);
-                        if(debug > 1)
-                            fprintf(stderr, "Processing frame: 0x%x, skew %d\n",
-                                    frame_data, avg_skew);
-                        
-                        bool parity_bit = (frame_data & parity_mask) != 0;
-                        uint32_t data = (out_shift & data_mask) >> data_offset;
-                        bool data_parity = parity(data);
-                        
-                        if(debug > 1)
-                            fprintf(stderr, "Data: 0x%02x Parity: %c Data parity: %c\n", (int)data,
-                                parity_bit ? '1' : '0', data_parity ? '1' : '0'
-                            );
-                        
-                        // Check parity
-                        if(!parity_even) data_parity = !data_parity;
-                        
-                        // Parity check
-                        if(!parity_enable || (data_parity == parity_bit))
-                        {
-                            // All OK
-                            if(lsb_first)
-                            {
-                                // Assume we're working with no more than 8 data bits!
-                                data <<= (8 - data_size);
-                                
-                                // Reverse bits in byte (LSB is first transmitted)
-                                // http://graphics.stanford.edu/~seander/bithacks.html#ReverseByteWith64BitsDiv
-                                data = (data * 0x0202020202ULL & 0x010884422010ULL) % 1023;
-                            }
-                            
-                            data &= 0xff;
-                            
-                            if(debug > 1)
-                                fprintf(stderr, "Got byte: 0x%02x\n", data);
-                            printf("%c", (char)data);
-                            fflush(stdout);
-                        }
-                        else
-                        {
-                            if(debug > 1)
-                                fprintf(stderr, "Dropping frame with bad parity\n");
-                            if(errchar)
-                            {
-                                printf("%c", errchar);
-                                fflush(stdout);
-                            }
-                        }
-                    }
-                }
-            }
-            else if(debug > 2)
-                fprintf(stderr, "Waiting for a valid frame\n");
-            
-            bit_wait += bit_period_samples;
-        }
+        framefmt& ff = modem.ff;
+        fprintf(stderr, "%s the %s channel\n",
+                demodulate ? "Demodulating" : "Modulating", forward ? "FORWARD" : "BACKWARD");
+        fprintf(stderr, "Mark frequency:  %d Hz\n", modem.mark_freqhz);
+        fprintf(stderr, "Space frequency: %d Hz\n", modem.space_freqhz);
+        fprintf(stderr, "Bit period:      %d samples\n", modem.samples_per_bit);
+        fprintf(stderr, "Max skew:        %d samples\n", modem.max_skew);
+        fprintf(stderr, "Frame size:      %d, format %s\n", ff.frame_size, frame_format);
+        fprintf(stderr, "Data size:       %d, %s first, with %s parity\n",
+                ff.data_size, ff.lsb_first ? "lsb":"msb",
+                ff.parity_enable ? (ff.parity_even ? "even" : "odd" ) : "no");
     }
-  }
+    
+    if(demodulate)
+        v23_demodulate(modem);
+    else
+        v23_modulate(modem);
   
-  free(bufIn);
-  free(bufOut);
-  free(bufWork);
-  free(bufI);
-  free(bufQ);
-  free(bufMark);
-  free(bufSpace);
-  free(mafMarkI.buf);
-  free(mafMarkQ.buf);
-  free(mafSpaceI.buf);
-  free(mafSpaceQ.buf);
-  free(mafOut.buf);
-  free(mafBit.buf);
-  free(sinebuf);
-  
-  return 0;
+    
+    free(sinebuf);
+    
+    return 0;
 }
