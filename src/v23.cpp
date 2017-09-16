@@ -353,6 +353,21 @@ bool init_framefmt(framefmt& ff, const char* fmt, int overlap)
     return true;
 }
 
+// Note: This is a nasty function
+uint64_t bin_as_octal(uint32_t w)
+{
+    uint64_t d=0;
+    
+    for(int i=0; i<32; ++i)
+    {
+        d <<= 3;
+        if(w & 0x80000000) ++d;
+        w <<= 1;
+    }
+    
+    return d;
+}
+
 void init_modemcfg(modemcfg& m, int mark, int space, int samplerate, int baudrate, float skew_limit) {
     m.sample_rate     = samplerate;
     m.mark_freqhz     = mark;
@@ -462,7 +477,7 @@ void v23_demodulate(modemcfg& m) {
         for(size_t i=0; i<n; ++i)
         {
             last = state;
-            state = (bufOut[i] > 0);
+            state = (bufOut[i] > 0) ? 1 : 0;
             
             // Edge detected - re-align
             if(last != state) {
@@ -497,20 +512,20 @@ void v23_demodulate(modemcfg& m) {
                 bit_wait += adj;
             }
             
-            // If the shift register is all ones or all zeros, the line is idle
-            if(!line_idle && out_shift == -1 || out_shift == 0)
-            {
-                line_idle = true;
-                if(debug > 1)
-                    fprintf(stderr, "Line idle (%04x)\n", out_shift);
-            }
-            
             if(--bit_wait <= 0)
             {
                 if(debug > 3)
                     fprintf(stderr, "Read bit '%d'\n", state);
                 out_shift <<= 1;
                 out_shift += state;
+                
+                // If the shift register is all ones or all zeros, the line is idle
+                if(!line_idle && out_shift == -1 || out_shift == 0)
+                {
+                    line_idle = true;
+                    if(debug > 1)
+                        fprintf(stderr, "Line idle (%04x)\n", out_shift);
+                }
                 
                 if(frame_hold > 0)                                  // Frame Hold-off
                 {
@@ -529,7 +544,6 @@ void v23_demodulate(modemcfg& m) {
                         
                         // Set line idle in case we have partial stop bits
                         line_idle = true;
-                        frame_hold = f.frame_size - 1;
                         
                         if(avg_skew > m.max_skew)
                         {
@@ -538,10 +552,10 @@ void v23_demodulate(modemcfg& m) {
                         }
                         else
                         {
-                            int32_t frame_data = out_shift & ((1 << f.frame_size) - 1);
+                            uint32_t frame_data = out_shift & ((1 << (f.frame_size+1)) - 1);
                             if(debug > 1)
-                                fprintf(stderr, "Processing frame: 0x%x, skew %d\n",
-                                        frame_data, avg_skew);
+                                fprintf(stderr, "Processing frame: %llo, skew %d\n",
+                                        bin_as_octal(frame_data), avg_skew);
                             
                             bool parity_bit = (frame_data & f.parity_mask) != 0;
                             uint32_t data =   (frame_data & f.data_mask  ) >> f.data_offset;
@@ -601,6 +615,7 @@ void v23_demodulate(modemcfg& m) {
                 {
                     total_skew = 0;
                     num_transitions = 0;
+                    frame_hold = f.frame_size - 1;
                 }
                 
                 bit_wait += m.samples_per_bit;
@@ -661,7 +676,7 @@ void v23_modulate(modemcfg& m) {
                 out_shift = f.frame_pattern;
                 
                 // Truncate data if needed
-                uint32_t data = c_in & (( 1 << f.data_size ) - 1);
+                uint32_t data = (int)c_in & (( 1 << f.data_size ) - 1);
                 
                 // Work out parity
                 if( f.parity_enable && ( parity(data) == f.parity_even ) )
@@ -691,7 +706,7 @@ void v23_modulate(modemcfg& m) {
                 bits_in_buffer = f.frame_size;
                 
                 if(debug > 1)
-                    fprintf(stderr, "Frame for input 0x%02x: 0x%03x\n", (int)c_in, out_shift);
+                    fprintf(stderr, "Frame for input 0x%02x: %llo\n", (int)c_in, bin_as_octal(out_shift));
                 
                 // One last manipulation: shift the data to the top of the word
                 out_shift <<= (32 - f.frame_size);
@@ -700,8 +715,14 @@ void v23_modulate(modemcfg& m) {
         
         if( bits_in_buffer > 0 )
         {
+            int i_out = 0;
             // Get next bit
-            if(out_shift & 0x80000000)
+            if(out_shift & 0x80000000) i_out = 1;
+                
+            if(debug > 2)
+                fprintf(stderr, "State '%d'\n", i_out);
+            
+            if(i_out)
                 o.freqhz = m.mark_freqhz;
             else
                 o.freqhz = m.space_freqhz;
