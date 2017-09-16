@@ -394,11 +394,12 @@ void v23_demodulate(modemcfg& m) {
     o.freqhz = (m.mark_freqhz + m.space_freqhz) / 2;
     
     delta_freqhz = (delta_freqhz < 0) ? -delta_freqhz : delta_freqhz;
-    int input_maf_samples = m.sample_rate / (delta_freqhz / 2);
+    int input_maf_samples = m.sample_rate / delta_freqhz;
     if(debug > 0)
     {
-        fprintf(stderr, "IQ delta freq: %d Hz\n", delta_freqhz);
-        fprintf(stderr, "IQ MAF:        %d samples\n", input_maf_samples);
+        fprintf(stderr, "IQ delta freq:  %d Hz\n", delta_freqhz);
+        fprintf(stderr, "LO centre freq: %d Hz\n", o.freqhz);
+        fprintf(stderr, "IQ MAF:         %d samples\n", input_maf_samples);
     }
     
     if(! (
