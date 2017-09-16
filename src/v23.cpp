@@ -537,7 +537,7 @@ void v23_demodulate(modemcfg& m) {
                 {                    
                     // Check the quality
                     if(num_transitions == 0)
-                        fprintf(stderr, "Dropping frame with no transitions!\n");
+                        fprintf(stderr, "Dropping frame '%o' with no transitions!\n", out_shift);
                     else
                     {
                         int avg_skew = total_skew / num_transitions;
@@ -823,6 +823,8 @@ int main(int argc, char* argv[])
         init_modemcfg(modem, F_MARK_FREQ, F_SPACE_FREQ, sample_rate, F_BIT_RATE, SKEW_LIMIT);
     else
         init_modemcfg(modem, B_MARK_FREQ, B_SPACE_FREQ, sample_rate, B_BIT_RATE, SKEW_LIMIT);
+    
+    modem.errchar = errchar;
   
     if(!quiet)
     {
