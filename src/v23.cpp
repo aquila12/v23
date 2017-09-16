@@ -13,7 +13,8 @@
 #define F_BIT_RATE      1200
 #define B_BIT_RATE      75
 
-#define SKEW_LIMIT      0.2
+#define SKEW_LIMIT          0.4
+#define SKEW_CORRECT_FACTOR 3
 
 #define DEF_FRAME_FORMAT    "10dddddddp1"
 
@@ -311,12 +312,12 @@ void v23_demodulate(modemcfg& m) {
     
     // Quality monitoring
     int num_transitions = 0;
-    int total_skew_correction = 0;
+    int total_skew = 0;
     
     maf mafMarkI, mafMarkQ, mafSpaceI, mafSpaceQ, mafOut, mafBit;
     size_t N = 1024; // Maximum samples we can take at once
     
-    size_t bit_wait = m.samples_per_bit;  // Samples left until we read a bit
+    int bit_wait = m.samples_per_bit;  // Samples left until we read a bit
     
     // Set up the moving average filters
     int delta_freqhz = m.mark_freqhz - m.space_freqhz;
@@ -353,6 +354,7 @@ void v23_demodulate(modemcfg& m) {
 
     size_t n;     // Number of samples we have this time
     int state=0;  // What was the last state
+    bool line_idle = true;  // Are we in idle mode?
     while(n = get_input_samples(bufIn, N))
     {
         //printf("Got %d of %d samples...\n", n, N);
@@ -390,29 +392,47 @@ void v23_demodulate(modemcfg& m) {
             // Edge detected - re-align
             if(last != state) {
                 int adj = (m.samples_per_bit / 2) - bit_wait;
-                if(debug > 1)
-                    fprintf(stderr, "Realigned by %d samples\n", adj);
+                if(debug > 2)
+                    fprintf(stderr, "Transition, skew: %d samples\n", adj);
                 
-                bit_wait = m.samples_per_bit / 2;
+                // Don't count the first correction, and correct completely
+                if(line_idle)
+                    line_idle = false;
+                else
+                {
+                    total_skew += (adj >= 0) ? adj : -adj;
+                    ++num_transitions;
+                    
+                    // Figure out the adjustment to make
+                    // ALWAYS adjust in the correct direction
+                    // ALWAYS correct by at least one, unless the error is zero
+                    if(adj > 0) {
+                        adj /= SKEW_CORRECT_FACTOR;
+                        adj += 1;
+                    }
+                    else if(adj < 0) {
+                        adj /= SKEW_CORRECT_FACTOR;
+                        adj -= 1;
+                    }
+                    bit_wait += adj;
+                }
+                if(debug > 2)
+                    fprintf(stderr, "Adjusting by %d samples\n", adj);
                 
-                // Don't count the first correction
-                if(num_transitions > 0)
-                    total_skew_correction += (adj >= 0) ? adj : -adj;
-                ++num_transitions;
+                bit_wait += adj;
             }
             
-            // If the shift register is all ones or all zeros, dump the skew counter 
-            if(out_shift == -1 || out_shift == 0)
+            // If the shift register is all ones or all zeros, the line is idle
+            if(!line_idle && out_shift == -1 || out_shift == 0)
             {
-                total_skew_correction = 0;
-                num_transitions = 0;
-                if(debug > 3)
+                line_idle = true;
+                if(debug > 1)
                     fprintf(stderr, "Line idle (%04x)\n", out_shift);
             }
             
             if(--bit_wait <= 0)
             {
-                if(debug > 2)
+                if(debug > 3)
                     fprintf(stderr, "Read bit '%d'\n", state);
                 out_shift <<= 1;
                 out_shift += state;
@@ -424,20 +444,16 @@ void v23_demodulate(modemcfg& m) {
                         fprintf(stderr, "Frame hold (%d left)\n", frame_hold);
                 }
                 else if((out_shift & f.frame_mask) == f.frame_pattern)    // Frame is valid
-                {
-                    // Start of the frame doesn't get counted
-                    --num_transitions;
-                    
+                {                    
                     // Check the quality
                     if(num_transitions == 0)
                         fprintf(stderr, "Dropping frame with no transitions!\n");
                     else
                     {
-                        int avg_skew = total_skew_correction / num_transitions;
+                        int avg_skew = total_skew / num_transitions;
                         
-                        // Reset counters
-                        total_skew_correction = 0;
-                        num_transitions = 0;
+                        // Set line idle in case we have partial stop bits
+                        line_idle = true;
                         frame_hold = f.frame_size - 1;
                         
                         if(avg_skew > m.max_skew)
@@ -498,8 +514,18 @@ void v23_demodulate(modemcfg& m) {
                         }
                     }
                 }
-                else if(debug > 2)
-                    fprintf(stderr, "Waiting for a valid frame\n");
+                else if(!line_idle)
+                {
+                    if (debug > 2)
+                        fprintf(stderr, "Waiting for a valid frame\n");
+                }
+                
+                // If the line is in idle state, reset the skew and transition count
+                if(line_idle)
+                {
+                    total_skew = 0;
+                    num_transitions = 0;
+                }
                 
                 bit_wait += m.samples_per_bit;
             }
