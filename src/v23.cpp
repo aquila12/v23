@@ -28,6 +28,10 @@ struct maf {
   int32_t sum;
 };
 
+struct differentiator {
+  int16_t last;
+};
+
 struct osc {
   int freqhz;
   int p;
@@ -173,6 +177,17 @@ void sub_samples(int16_t *samples_a, int16_t *samples_b,
   }
 }
 
+void deriv_samples(differentiator& d, int16_t *samples_in, int16_t *samples_out, size_t n_samples)
+{
+    int16_t last = d.last;
+    for(size_t i=0; i<n_samples; ++i)
+    {
+        samples_out[i] = samples_in[i] - last;
+        last = samples_in[i];
+    }
+    d.last = last;
+}
+
 void sgn_samples(int16_t *samples_in, int16_t *samples_out, size_t n_samples)
 {
   for(size_t i=0; i<n_samples; ++i)
@@ -208,6 +223,43 @@ void mag_complex_samples(int16_t *samples_i, int16_t *samples_q,
     else
         samples_out[i] = mag;
   }
+}
+
+void ang_complex_samples(int16_t *samples_i, int16_t *samples_q,
+  int16_t *samples_out, size_t n_samples)
+{
+    for(size_t i=0; i<n_samples; ++i)
+    {        
+        // Hacky inverse tangent approximation
+        // Taken from my Wheeliebot guidance code
+        int32_t x, y, abs_x, abs_y, angle;
+        x = samples_i[i];
+        y = samples_q[i];
+        
+        if(x==0 && y==0)
+        {
+            samples_out[i] = 0;
+            continue;
+        }
+        
+        // NOTE: Output phase units are 1/65536 revolution,
+        // i.e. output variable overflows once per cycle
+        abs_x = (x < 0) ? -x : x;
+        abs_y = (y < 0) ? -y : y;
+        
+        if(abs_x > abs_y)
+        {
+            angle = (8192 * y) / x;
+            if(x < 0) angle += 32768;
+        }
+        else
+        {
+            angle = 16384 - (8192 * x) / y;
+            if(y < 0) angle += 32768;
+        }
+            
+        samples_out[i] = angle;
+    }
 }
 
 void output_buf(int16_t *samples_i, size_t n_samples)
@@ -295,18 +347,18 @@ void init_modemcfg(modemcfg& m, int mark, int space, int samplerate, int baudrat
 
 void v23_demodulate(modemcfg& m) {
     framefmt& f = m.ff;
-    // Local mark / space demodulation oscillators
-    osc oscMarkIn, oscSpaceIn;
-    oscMarkIn.p = 0;
-    oscSpaceIn.p = 0;
-    oscMarkIn.freqhz  = m.mark_freqhz;
-    oscSpaceIn.freqhz = m.space_freqhz;
+    // Local oscillator
+    osc o;
+    o.p = 0;
+    differentiator diffAng;
+    diffAng.last = 0;
   
     // Working registers
-    int16_t *bufIn, *bufOut;
-    int16_t *bufWork;
+    int16_t *bufIn;
     int16_t *bufI, *bufQ;
-    int16_t *bufMark, *bufSpace;
+    int16_t *bufAng;
+    int16_t *bufWork, *bufOut;
+    
     int32_t out_shift = -1; // Raw serial shift-register
     int frame_hold = 50;    // How many bits to hold off for - preset to stabilize the MAFs
     
@@ -314,13 +366,16 @@ void v23_demodulate(modemcfg& m) {
     int num_transitions = 0;
     int total_skew = 0;
     
-    maf mafMarkI, mafMarkQ, mafSpaceI, mafSpaceQ, mafOut, mafBit;
+    maf mafI, mafQ, mafAng, mafOut, mafBit;
     size_t N = 1024; // Maximum samples we can take at once
     
     int bit_wait = m.samples_per_bit;  // Samples left until we read a bit
     
     // Set up the moving average filters
-    int delta_freqhz = m.mark_freqhz - m.space_freqhz;
+    // NOTE: delta_freqhz +ve when MARK is higher frequency
+    int delta_freqhz  = m.mark_freqhz - m.space_freqhz;
+    o.freqhz = (m.mark_freqhz + m.space_freqhz) / 2;
+    
     delta_freqhz = (delta_freqhz < 0) ? -delta_freqhz : delta_freqhz;
     int input_maf_samples = m.sample_rate / (delta_freqhz / 2);
     if(debug > 0)
@@ -330,10 +385,8 @@ void v23_demodulate(modemcfg& m) {
     }
     
     if(! (
-        maf_init(mafMarkI,  m.samples_per_bit) &&
-        maf_init(mafMarkQ,  m.samples_per_bit) &&
-        maf_init(mafSpaceI, m.samples_per_bit) &&
-        maf_init(mafSpaceQ, m.samples_per_bit) &&
+        maf_init(mafI,  input_maf_samples)     &&
+        maf_init(mafQ,  input_maf_samples)     &&
         maf_init(mafOut,    m.samples_per_bit) &&
         maf_init(mafBit,    m.samples_per_bit) )) {
         
@@ -342,14 +395,13 @@ void v23_demodulate(modemcfg& m) {
     }
     
     bufIn    = make_buffer(N);
-    bufOut   = make_buffer(N);
-    bufWork  = make_buffer(N);
     bufI     = make_buffer(N);
     bufQ     = make_buffer(N);
-    bufMark  = make_buffer(N);
-    bufSpace = make_buffer(N);
+    bufAng   = make_buffer(N);
+    bufWork  = make_buffer(N);
+    bufOut   = make_buffer(N);
   
-    if(!( bufIn && bufOut && bufWork && bufI && bufQ && bufMark && bufSpace))
+    if(!( bufIn && bufI && bufQ && bufAng && bufWork  && bufOut))
     {
         fprintf(stderr, "Failed to allocate buffers\n");
         exit(1);
@@ -364,24 +416,16 @@ void v23_demodulate(modemcfg& m) {
     while(n = get_input_samples(bufIn, N))
     {
         //printf("Got %d of %d samples...\n", n, N);
-        // Mix and filter the Mark oscillator
-        osc_get_complex_samples(oscMarkIn, bufI, bufQ, n);
+        // Mix and filter the local oscillator
+        osc_get_complex_samples(o, bufI, bufQ, n);
         mul_samples(bufIn, bufI, bufWork, n);
-        maf_process(mafMarkI, bufWork, bufI, n);
+        maf_process(mafI, bufWork, bufI, n);
         mul_samples(bufIn, bufQ, bufWork, n);
-        maf_process(mafMarkQ, bufWork, bufQ, n);
-        mag_complex_samples(bufI, bufQ, bufMark, n);
-
-        // Mix and filter the Space oscillator
-        osc_get_complex_samples(oscSpaceIn, bufI, bufQ, n);
-        mul_samples(bufIn, bufI, bufWork, n);
-        maf_process(mafSpaceI, bufWork, bufI, n);
-        mul_samples(bufIn, bufQ, bufWork, n);
-        maf_process(mafSpaceQ, bufWork, bufQ, n);
-        mag_complex_samples(bufI, bufQ, bufSpace, n);
-
-        // Subtract the magnitudes and feed output MAF
-        sub_samples(bufMark, bufSpace, bufWork, n);
+        maf_process(mafQ, bufWork, bufQ, n);
+        
+        // Determine the phase, phase change, then filter it
+        ang_complex_samples(bufI, bufQ, bufAng, n);
+        deriv_samples(diffAng, bufAng, bufWork, n);
         maf_process(mafOut, bufWork, bufOut, n);
         
         // Bit sampling
@@ -539,16 +583,13 @@ void v23_demodulate(modemcfg& m) {
     }
     
     free(bufIn);
-    free(bufOut);
-    free(bufWork);
     free(bufI);
     free(bufQ);
-    free(bufMark);
-    free(bufSpace);
-    free(mafMarkI.buf);
-    free(mafMarkQ.buf);
-    free(mafSpaceI.buf);
-    free(mafSpaceQ.buf);
+    free(bufAng);
+    free(bufWork);
+    free(bufOut);
+    free(mafI.buf);
+    free(mafQ.buf);
     free(mafOut.buf);
     free(mafBit.buf);
 }
