@@ -322,7 +322,13 @@ void v23_demodulate(modemcfg& m) {
     // Set up the moving average filters
     int delta_freqhz = m.mark_freqhz - m.space_freqhz;
     delta_freqhz = (delta_freqhz < 0) ? -delta_freqhz : delta_freqhz;
-    int input_maf_samples = m.sample_rate / delta_freqhz;
+    int input_maf_samples = m.sample_rate / (delta_freqhz / 2);
+    if(debug > 0)
+    {
+        fprintf(stderr, "IQ delta freq: %d Hz\n", delta_freqhz);
+        fprintf(stderr, "IQ MAF:        %d samples\n", input_maf_samples);
+    }
+    
     if(! (
         maf_init(mafMarkI,  delta_freqhz / 2) &&
         maf_init(mafMarkQ,  delta_freqhz / 2) &&
