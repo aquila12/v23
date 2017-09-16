@@ -362,7 +362,7 @@ void init_modemcfg(modemcfg& m, int mark, int space, int samplerate, int baudrat
 }
 
 void v23_demodulate(modemcfg& m) {
-    FILE* out = monit ? stderr : stdout;    // Output chars to stderr if we're monitoring
+    FILE* out = (monit > 0) ? stderr : stdout;    // Output chars to stderr if we're monitoring
     framefmt& f = m.ff;
     // Local oscillator
     osc o;
