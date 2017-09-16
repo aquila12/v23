@@ -679,6 +679,7 @@ int main(int argc, char* argv[])
                     break;
                 case 'M':   // Monitor mode
                     ++monit;
+                    break;
                 default:
                     fprintf(stderr, "Unknown flag: %c\n", arg[1]);
                     exit(1);
