@@ -46,6 +46,7 @@ struct framefmt {
 };
 
 struct modemcfg {
+    int sample_rate;
     int mark_freqhz;
     int space_freqhz;
     framefmt ff;
@@ -283,6 +284,7 @@ bool init_framefmt(framefmt& ff, const char* fmt, int overlap)
 }
 
 void init_modemcfg(modemcfg& m, int mark, int space, int samplerate, int baudrate, float skew_limit) {
+    m.sample_rate     = samplerate;
     m.mark_freqhz     = mark;
     m.space_freqhz    = space;
     m.samples_per_bit = samplerate / baudrate;
@@ -317,11 +319,14 @@ void v23_demodulate(modemcfg& m) {
     size_t bit_wait = m.samples_per_bit;  // Samples left until we read a bit
     
     // Set up the moving average filters
+    int delta_freqhz = m.mark_freqhz - m.space_freqhz;
+    delta_freqhz = (delta_freqhz < 0) ? -delta_freqhz : delta_freqhz;
+    int input_maf_samples = m.sample_rate / delta_freqhz;
     if(! (
-        maf_init(mafMarkI,  m.samples_per_bit) &&
-        maf_init(mafMarkQ,  m.samples_per_bit) &&
-        maf_init(mafSpaceI, m.samples_per_bit) &&
-        maf_init(mafSpaceQ, m.samples_per_bit) &&
+        maf_init(mafMarkI,  delta_freqhz / 2) &&
+        maf_init(mafMarkQ,  delta_freqhz / 2) &&
+        maf_init(mafSpaceI, delta_freqhz / 2) &&
+        maf_init(mafSpaceQ, delta_freqhz / 2) &&
         maf_init(mafOut,    m.samples_per_bit) &&
         maf_init(mafBit,    m.samples_per_bit) )) {
         
