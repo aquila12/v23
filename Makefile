@@ -1,4 +1,4 @@
-TARGET_EXEC ?= a.out
+TARGET_EXEC ?= v23
 
 BUILD_DIR ?= ./build
 SRC_DIRS ?= ./src
