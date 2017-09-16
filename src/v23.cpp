@@ -330,10 +330,10 @@ void v23_demodulate(modemcfg& m) {
     }
     
     if(! (
-        maf_init(mafMarkI,  delta_freqhz / 2) &&
-        maf_init(mafMarkQ,  delta_freqhz / 2) &&
-        maf_init(mafSpaceI, delta_freqhz / 2) &&
-        maf_init(mafSpaceQ, delta_freqhz / 2) &&
+        maf_init(mafMarkI,  m.samples_per_bit) &&
+        maf_init(mafMarkQ,  m.samples_per_bit) &&
+        maf_init(mafSpaceI, m.samples_per_bit) &&
+        maf_init(mafSpaceQ, m.samples_per_bit) &&
         maf_init(mafOut,    m.samples_per_bit) &&
         maf_init(mafBit,    m.samples_per_bit) )) {
         
