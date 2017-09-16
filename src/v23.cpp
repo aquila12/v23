@@ -20,6 +20,7 @@
 
 int quiet=0;
 int debug=0;
+int monit=0;
 
 struct maf {
   int16_t *buf;
@@ -155,12 +156,12 @@ void mul_samples(int16_t *samples_a, int16_t *samples_b,
     int32_t product = ((int32_t)samples_a[i] * (int32_t)samples_b[i]) / (int32_t)32768;
     if(product >  32767)
     {
-        printf("mul: clipped\n");
+        fprintf(stderr, "mul: clipped\n");
         product =  32767;
     }
     else if(product < -32767)
     {
-        printf("mul: clipped\n");
+        fprintf(stderr, "mul: clipped\n");
         product = -32767;
     }
     samples_out[i] = (int16_t)product;
@@ -217,7 +218,7 @@ void mag_complex_samples(int16_t *samples_i, int16_t *samples_q,
 
     if(mag >  32767)
     {
-        printf("mag: clipped\n");
+        fprintf(stderr, "mag: clipped\n");
         samples_out[i] = 32767;
     }
     else
@@ -265,6 +266,21 @@ void ang_complex_samples(int16_t *samples_i, int16_t *samples_q,
 void output_buf(int16_t *samples_i, size_t n_samples)
 {
   write(1, samples_i, n_samples * sizeof(int16_t));
+}
+
+void output_multi(int16_t *buffers[], size_t n_bufs, size_t n_samples)
+{
+    int16_t outbuf[n_bufs];
+    
+    for(size_t i=0; i<n_samples; ++i)
+    {
+        for(size_t j=0; j<n_bufs; ++j)
+        {
+            int16_t *b = buffers[j];
+            outbuf[j]=b[i];
+        }
+        write(1, outbuf, sizeof(int16_t) * n_bufs);
+    }
 }
 
 size_t get_input_samples(int16_t *buf, size_t n) {
@@ -346,6 +362,7 @@ void init_modemcfg(modemcfg& m, int mark, int space, int samplerate, int baudrat
 }
 
 void v23_demodulate(modemcfg& m) {
+    FILE* out = monit ? stderr : stdout;    // Output chars to stderr if we're monitoring
     framefmt& f = m.ff;
     // Local oscillator
     osc o;
@@ -427,6 +444,12 @@ void v23_demodulate(modemcfg& m) {
         ang_complex_samples(bufI, bufQ, bufAng, n);
         deriv_samples(diffAng, bufAng, bufWork, n);
         maf_process(mafOut, bufWork, bufOut, n);
+        
+        if(monit > 0)
+        {
+          int16_t *bufs[] = {bufIn, bufI, bufQ, bufAng, bufWork, bufOut};
+          output_multi(bufs, 6, n);
+        }
         
         // Bit sampling
         sgn_samples(bufOut, bufWork, n);
@@ -548,8 +571,9 @@ void v23_demodulate(modemcfg& m) {
                                 
                                 if(debug > 1)
                                     fprintf(stderr, "Got byte: 0x%02x\n", data);
-                                printf("%c", (char)data);
-                                fflush(stdout);
+                                
+                                fprintf(out, "%c", (char)data );
+                                fflush(out);
                             }
                             else
                             {
@@ -557,8 +581,8 @@ void v23_demodulate(modemcfg& m) {
                                     fprintf(stderr, "Dropping frame with bad parity\n");
                                 if(m.errchar)
                                 {
-                                    printf("%c", m.errchar);
-                                    fflush(stdout);
+                                    fprintf(out, "%c", m.errchar);
+                                    fflush(out);
                                 }
                             }
                         }
@@ -653,6 +677,8 @@ int main(int argc, char* argv[])
                 case 'f':   // Frame format specifier
                     frame_format = &arg[2];
                     break;
+                case 'M':   // Monitor mode
+                    ++monit;
                 default:
                     fprintf(stderr, "Unknown flag: %c\n", arg[1]);
                     exit(1);
