@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cmath>
 #include <unistd.h>
+#include <fcntl.h>
 
 #define DEF_SAMPLE_RATE 44100
 #define F_MARK_FREQ     1300
@@ -39,7 +40,7 @@ struct osc {
 };
 
 struct framefmt {
-    int frame_size; // Overall size of a frame
+    int frame_size;         // Overall size of a frame
     int32_t frame_pattern;  // Pattern to look for, including previous idle / stop bit
     int32_t frame_mask;     // Mask to apply before checking for pattern
     int32_t parity_mask;    // Mask to apply to find parity bit
@@ -619,8 +620,104 @@ void v23_demodulate(modemcfg& m) {
     free(mafBit.buf);
 }
 
-void v23_modulate(modemcfg& m) {
-    // TODO: Implement
+void v23_modulate(modemcfg& m) {    
+    // Set non-blocking input (STDIN)
+    int flags = fcntl(0, F_GETFL, 0);
+    fcntl(0, F_SETFL, flags | O_NONBLOCK);
+    
+    framefmt& f = m.ff;
+    
+    osc o;
+    o.p = 0;
+    o.freqhz = m.mark_freqhz;
+    
+    int32_t out_shift = -1;
+    int bits_in_buffer = 0;
+    int bit_wait = m.sample_rate;   // At least 1s leader tone
+    
+    bool line_idle = true;
+    
+    size_t N = m.samples_per_bit;   // Number of samples to handle at once
+    
+    int16_t *bufOut;
+    bufOut = make_buffer(N);
+    if(!bufOut)
+    {
+        fprintf(stderr, "Failed to allocate buffers\n");
+        exit(1);
+    }
+    
+    // Not ideal, but it's about what we want
+    while(true)
+    {
+        // Time for another byte?
+        if( bits_in_buffer < 1 )
+        {
+            // Is there a byte available ?
+            unsigned char c_in;
+            if(read(0, &c_in, 1) > 0)
+            {
+                // Set up the frame
+                out_shift = f.frame_pattern;
+                
+                // Truncate data if needed
+                uint32_t data = c_in & (( 1 << f.data_size ) - 1);
+                
+                // Work out parity
+                if( f.parity_enable && ( parity(data) == f.parity_even ) )
+                {
+                    // Set all parity bits if needed
+                    out_shift |= f.parity_mask;
+                }
+                
+                // Sort out the data order
+                if(f.lsb_first)
+                {
+                    // Assume we're working with no more than 8 data bits!
+                    data <<= (8 - f.data_size);
+                    
+                    // Reverse bits in byte (LSB is first transmitted)
+                    // http://graphics.stanford.edu/~seander/bithacks.html#ReverseByteWith64BitsDiv
+                    data = (data * 0x0202020202ULL & 0x010884422010ULL) % 1023;
+                }
+                
+                // Manipulate the data bits into the right position
+                data <<= f.data_offset;
+                data &=  f.data_mask;  // Probably not necessary... just in case
+                
+                // Set the data bits
+                out_shift |= data;
+                
+                bits_in_buffer = f.frame_size;
+                
+                if(debug > 1)
+                    fprintf(stderr, "Frame for input 0x%02x: 0x%03x\n", (int)c_in, out_shift);
+                
+                // One last manipulation: shift the data to the top of the word
+                out_shift <<= (32 - f.frame_size);
+            }
+        }
+        
+        if( bits_in_buffer > 0 )
+        {
+            // Get next bit
+            if(out_shift & 0x80000000)
+                o.freqhz = m.mark_freqhz;
+            else
+                o.freqhz = m.space_freqhz;
+            
+            out_shift <<= 1;
+            --bits_in_buffer;
+        }
+        else
+            o.freqhz = m.mark_freqhz;   // Idle
+            
+        // Get the oscillator samples and dump them to stdout
+        osc_get_samples(o, bufOut, N);
+        output_buf(bufOut, N);
+    }
+    
+    free(bufOut);
 };
 
 int main(int argc, char* argv[])
@@ -655,8 +752,8 @@ int main(int argc, char* argv[])
                     break;
                 case 'm':   // Set mode
                     switch(arg[2]) {
-                        case 'm': demodulate = true; break;
-                        case 'd': demodulate = false; break;
+                        case 'm': demodulate = false; break;
+                        case 'd': demodulate = true; break;
                         default:
                             fprintf(stderr, "Error: use -mm to modulate or -md to demodulate\n");
                             exit(1);
