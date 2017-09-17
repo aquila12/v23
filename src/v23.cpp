@@ -379,6 +379,25 @@ void init_modemcfg(modemcfg& m, int mark, int space, int firstnull, int samplera
     m.first_null      = firstnull;
 }
 
+// This is a gross, hacky estimator
+// A decent one would be doing RMS, i.e. standard deviation
+// But we don't want to bother with that right now
+// NOTE: This is a sum-of-deviation - there is NO DIVISION
+int estimate_phase_noise(maf& m)
+{
+    int total_deviation;
+    int d;
+    int N = m.N;
+    int mean = (m.sum + (N/2)) / N;
+    for(size_t i=0; i<m.N; ++i)
+    {
+        d = m.buf[i] - mean;
+        if(d < 0) d = -d;
+        total_deviation += d;
+    }
+    return total_deviation;
+}
+
 void v23_demodulate(modemcfg& m) {
     FILE* out = (monit > 0) ? stderr : stdout;    // Output chars to stderr if we're monitoring
     framefmt& f = m.ff;
@@ -392,7 +411,7 @@ void v23_demodulate(modemcfg& m) {
     int16_t *bufIn;
     int16_t *bufI, *bufQ;
     int16_t *bufAng;
-    int16_t *bufWork, *bufOut, *bufTiming;
+    int16_t *bufWork, *bufOut, *bufSign, *bufTiming;
     
     int32_t out_shift = -1; // Raw serial shift-register
     int frame_hold = 50;    // How many bits to hold off for - preset to stabilize the MAFs
@@ -434,9 +453,10 @@ void v23_demodulate(modemcfg& m) {
     bufAng    = make_buffer(N);
     bufWork   = make_buffer(N);
     bufOut    = make_buffer(N);
+    bufSign   = make_buffer(N);
     bufTiming = make_buffer(N);
   
-    if(!( bufIn && bufI && bufQ && bufAng && bufWork  && bufOut &&  bufTiming))
+    if(!( bufIn && bufI && bufQ && bufAng && bufWork  && bufOut && bufSign && bufTiming))
     {
         fprintf(stderr, "Failed to allocate buffers\n");
         exit(1);
@@ -478,13 +498,13 @@ void v23_demodulate(modemcfg& m) {
         maf_process(mafOut, bufWork, bufOut, n);
         
         // Sign sampling and filtering to inform timing
-        sgn_samples(bufOut, bufWork, n);
-        maf_process(mafBit, bufWork, bufTiming, n, true);
+        sgn_samples(bufOut, bufSign, n);
+        maf_process(mafBit, bufSign, bufTiming, n, true);
         
         if(monit > 0)
         {
-          int16_t *bufs[] = {bufIn, bufI, bufQ, bufAng, bufOut, bufTiming};
-          output_multi(bufs, 6, n);
+          int16_t *bufs[] = {bufIn, bufI, bufQ, bufAng, bufWork, bufOut, bufSign, bufTiming};
+          output_multi(bufs, 8, n);
         }
         
         // Run through the output samples
@@ -558,72 +578,76 @@ void v23_demodulate(modemcfg& m) {
                         fprintf(stderr, "Frame hold (%d left)\n", frame_hold);
                 }
                 else if((out_shift & f.frame_mask) == f.frame_pattern)    // Frame is valid
-                {                    
+                {
+                    int avg_skew = 0;   // We can't measure skew of a frame with no observed transitions
+                    if(num_transitions > 0) avg_skew = total_skew / num_transitions;
+                    
+                    int pnoise = estimate_phase_noise(mafOut);
+                    int ptotal = (mafOut.sum > 0) ? mafOut.sum : -mafOut.sum;
+                    
+                    // Set line idle as we don't want to rehandle this frame
+                    line_idle = true;
+                    
                     // Check the quality
-                    if(num_transitions == 0)
-                        fprintf(stderr, "Dropping frame '%o' with no transitions!\n", out_shift);
+                    if(avg_skew > m.max_skew)
+                    {
+                        if(debug > 1)
+                            fprintf(stderr, "Dropping frame with high skew of %d\n", avg_skew);
+                    }
+//                     else if(pnoise > ptotal)
+//                     {
+//                         if(debug > 1)
+//                             fprintf(stderr, "Dropping frame with high phase noise\n");
+//                     }
                     else
                     {
-                        int avg_skew = total_skew / num_transitions;
+                        uint32_t frame_data = out_shift & ((1 << (f.frame_size+1)) - 1);
+                        if(debug > 1)
+                            fprintf(stderr, "Processing frame: %llo, skew %d\n",
+                                    bin_as_octal(frame_data), avg_skew);
                         
-                        // Set line idle in case we have partial stop bits
-                        line_idle = true;
+                        bool parity_bit = (frame_data & f.parity_mask) != 0;
+                        uint32_t data =   (frame_data & f.data_mask  ) >> f.data_offset;
+                        bool data_parity = parity(data);
                         
-                        if(avg_skew > m.max_skew)
+                        if(debug > 1)
+                            fprintf(stderr, "Data: 0x%02x Parity: %c Data parity: %c\n", (int)data,
+                                parity_bit ? '1' : '0', data_parity ? '1' : '0'
+                            );
+                        
+                        // Check parity
+                        if(!f.parity_even) data_parity = !data_parity;
+                        
+                        // Parity check
+                        if(!f.parity_enable || (data_parity == parity_bit))
                         {
+                            // All OK
+                            if(f.lsb_first)
+                            {
+                                // Assume we're working with no more than 8 data bits!
+                                data <<= (8 - f.data_size);
+                                
+                                // Reverse bits in byte (LSB is first transmitted)
+                                // http://graphics.stanford.edu/~seander/bithacks.html#ReverseByteWith64BitsDiv
+                                data = (data * 0x0202020202ULL & 0x010884422010ULL) % 1023;
+                            }
+                            
+                            data &= 0xff;
+                            
                             if(debug > 1)
-                                fprintf(stderr, "Dropping frame with high skew of %d\n", avg_skew);
+                                fprintf(stderr, "Got byte: 0x%02x\n", data);
+                            
+                            fprintf(out, "%c", (char)data );
+                            fflush(out);
                         }
                         else
                         {
-                            uint32_t frame_data = out_shift & ((1 << (f.frame_size+1)) - 1);
                             if(debug > 1)
-                                fprintf(stderr, "Processing frame: %llo, skew %d\n",
-                                        bin_as_octal(frame_data), avg_skew);
-                            
-                            bool parity_bit = (frame_data & f.parity_mask) != 0;
-                            uint32_t data =   (frame_data & f.data_mask  ) >> f.data_offset;
-                            bool data_parity = parity(data);
-                            
-                            if(debug > 1)
-                                fprintf(stderr, "Data: 0x%02x Parity: %c Data parity: %c\n", (int)data,
-                                    parity_bit ? '1' : '0', data_parity ? '1' : '0'
-                                );
-                            
-                            // Check parity
-                            if(!f.parity_even) data_parity = !data_parity;
-                            
-                            // Parity check
-                            if(!f.parity_enable || (data_parity == parity_bit))
+                                fprintf(stderr, "Dropping frame with bad parity\n");
+                            if(m.errchar)
                             {
-                                // All OK
-                                if(f.lsb_first)
-                                {
-                                    // Assume we're working with no more than 8 data bits!
-                                    data <<= (8 - f.data_size);
-                                    
-                                    // Reverse bits in byte (LSB is first transmitted)
-                                    // http://graphics.stanford.edu/~seander/bithacks.html#ReverseByteWith64BitsDiv
-                                    data = (data * 0x0202020202ULL & 0x010884422010ULL) % 1023;
-                                }
-                                
-                                data &= 0xff;
-                                
-                                if(debug > 1)
-                                    fprintf(stderr, "Got byte: 0x%02x\n", data);
-                                
-                                fprintf(out, "%c", (char)data );
+                                fprintf(out, "%c", m.errchar);
                                 fflush(out);
-                            }
-                            else
-                            {
-                                if(debug > 1)
-                                    fprintf(stderr, "Dropping frame with bad parity\n");
-                                if(m.errchar)
-                                {
-                                    fprintf(out, "%c", m.errchar);
-                                    fflush(out);
-                                }
                             }
                         }
                     }
@@ -637,6 +661,7 @@ void v23_demodulate(modemcfg& m) {
                 // If the line is in idle state, reset the skew and transition count
                 if(line_idle)
                 {
+                    out_shift &= (2 << f.frame_size) - 1;
                     total_skew = 0;
                     num_transitions = 0;
                     frame_hold = f.frame_size - 1;
@@ -653,6 +678,8 @@ void v23_demodulate(modemcfg& m) {
     free(bufAng);
     free(bufWork);
     free(bufOut);
+    free(bufSign);
+    free(bufTiming);
     free(mafI.buf);
     free(mafQ.buf);
     free(mafOut.buf);
