@@ -54,6 +54,7 @@ struct framefmt {
 
 struct modemcfg {
     int sample_rate;
+    int first_null;
     int mark_freqhz;
     int space_freqhz;
     framefmt ff;
@@ -368,13 +369,14 @@ uint64_t bin_as_octal(uint32_t w)
     return d;
 }
 
-void init_modemcfg(modemcfg& m, int mark, int space, int samplerate, int baudrate, float skew_limit) {
+void init_modemcfg(modemcfg& m, int mark, int space, int firstnull, int samplerate, int baudrate, float skew_limit) {
     m.sample_rate     = samplerate;
     m.mark_freqhz     = mark;
     m.space_freqhz    = space;
     m.samples_per_bit = samplerate / baudrate;
     m.max_skew        = (float)samplerate * skew_limit / (float)baudrate;
     m.errchar         = 0;
+    m.first_null      = firstnull;
 }
 
 void v23_demodulate(modemcfg& m) {
@@ -404,18 +406,16 @@ void v23_demodulate(modemcfg& m) {
     
     int bit_wait = m.samples_per_bit;  // Samples left until we read a bit
     
-    // Set up the moving average filters
-    // NOTE: delta_freqhz +ve when MARK is higher frequency
-    int delta_freqhz  = m.mark_freqhz - m.space_freqhz;
+    // Set up the oscillators, filters etc
     o.freqhz = (m.mark_freqhz + m.space_freqhz) / 2;
     
-    delta_freqhz = (delta_freqhz < 0) ? -delta_freqhz : delta_freqhz;
-    int input_maf_samples = m.sample_rate / delta_freqhz;
+    // Place the first null for the input MAF
+    int input_maf_samples = m.sample_rate / m.first_null;
     if(debug > 0)
     {
-        fprintf(stderr, "IQ delta freq:  %d Hz\n", delta_freqhz);
         fprintf(stderr, "LO centre freq: %d Hz\n", o.freqhz);
         fprintf(stderr, "IQ MAF:         %d samples\n", input_maf_samples);
+        fprintf(stderr, "Null placed at: %d Hz\n", m.first_null);
     }
     
     if(! (
@@ -836,10 +836,10 @@ int main(int argc, char* argv[])
         exit(1);
     }
     
-    if(forward)
-        init_modemcfg(modem, F_MARK_FREQ, F_SPACE_FREQ, sample_rate, F_BIT_RATE, SKEW_LIMIT);
-    else
-        init_modemcfg(modem, B_MARK_FREQ, B_SPACE_FREQ, sample_rate, B_BIT_RATE, SKEW_LIMIT);
+    if(forward) // Forward:  Place the first null in the middle of the backward channel
+        init_modemcfg(modem, F_MARK_FREQ, F_SPACE_FREQ, 1280, sample_rate, F_BIT_RATE, SKEW_LIMIT);
+    else        // Backward: Place the first null just outside the band
+        init_modemcfg(modem, B_MARK_FREQ, B_SPACE_FREQ, 60, sample_rate, B_BIT_RATE, SKEW_LIMIT);
     
     modem.errchar = errchar;
   
