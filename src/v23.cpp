@@ -528,7 +528,6 @@ void v23_demodulate(modemcfg& m) {
                         adj /= SKEW_CORRECT_FACTOR;
                         adj -= 1;
                     }
-                    bit_wait += adj;
                 }
                 if(debug > 2)
                     fprintf(stderr, "Adjusting by %d samples\n", adj);
