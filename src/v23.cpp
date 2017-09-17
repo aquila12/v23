@@ -551,9 +551,9 @@ void v23_demodulate(modemcfg& m) {
                         fprintf(stderr, "Line idle (%04x)\n", out_shift);
                 }
                 
-                if(frame_hold > 0)                                  // Frame Hold-off
+                if(line_idle);  //Nothing
+                else if(--frame_hold > 0)                                  // Frame Hold-off
                 {
-                    --frame_hold;
                     if(debug > 2)
                         fprintf(stderr, "Frame hold (%d left)\n", frame_hold);
                 }
