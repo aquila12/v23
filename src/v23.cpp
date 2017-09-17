@@ -70,7 +70,7 @@ int16_t* make_buffer(size_t N)
   return (int16_t*)calloc(N, sizeof(int16_t));
 }
 
-bool sin_init(size_t N)
+bool sin_init(float amplitude, size_t N)
 {
   sinebuf = make_buffer(N);
   if(!sinebuf) return false;
@@ -80,7 +80,7 @@ bool sin_init(size_t N)
   for(size_t i=0; i<N; ++i)
   {
     double x = 2.0 * M_PI * (double)i / (double)N;
-    sinebuf[i] = (int16_t)(32767.0 * sin(x));
+    sinebuf[i] = (int16_t)(amplitude * sin(x));
   }
 
   return true;
@@ -743,12 +743,13 @@ void v23_modulate(modemcfg& m) {
 
 int main(int argc, char* argv[])
 {
-    bool demodulate = true; // By default, demodulate the backward channel.
+    bool demodulate = true;     // By default, demodulate the backward channel.
     bool forward = false;
-    char errchar = 0;       // No output for errors
+    char errchar = 0;           // No output for errors
     const char *frame_format = DEF_FRAME_FORMAT;
     modemcfg modem;
     int sample_rate = DEF_SAMPLE_RATE;
+    float amplitude = 32767.0;  // Full-scale
     
     // Process args
     for(int i=0; i<argc; ++i)
@@ -762,6 +763,19 @@ int main(int argc, char* argv[])
         case '-':   // Start of option
             switch(arg[1])
             {
+                case 'A':   // Set amplitude for modulation in dB
+                    {
+                        float dB=0.0;
+                        if(sscanf(&arg[2],"%f",&dB) < 1)
+                        {
+                            fprintf(stderr, "Error: -A requires a float e.g. -A3 for -3dB FS amplitude\n");
+                            exit(1);
+                        }
+                        amplitude = 32767.0 / pow(10.0, dB / 20.0);
+                        fprintf(stderr, "Set amplitude to -%f (amplitude %f)\n", dB, amplitude);
+                    }
+                    break;
+                    
                 case 'c':   // Set channel
                     switch(arg[2]) {
                         case 'f': forward = true; break;
@@ -807,8 +821,11 @@ int main(int argc, char* argv[])
         }
     }
     
+    // Demodulation expects the amplitude to be set to this!
+    if(demodulate) amplitude = 32767.0;
+    
     // Set up a the sine buffer
-    if(!sin_init(sample_rate)) {
+    if(!sin_init(amplitude, sample_rate)) {
         fprintf(stderr, "Failed to initialize sine buffer\n");
         exit(1);
     }
