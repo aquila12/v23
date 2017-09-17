@@ -379,25 +379,6 @@ void init_modemcfg(modemcfg& m, int mark, int space, int firstnull, int samplera
     m.first_null      = firstnull;
 }
 
-// This is a gross, hacky estimator
-// A decent one would be doing RMS, i.e. standard deviation
-// But we don't want to bother with that right now
-// NOTE: This is a sum-of-deviation - there is NO DIVISION
-int estimate_phase_noise(maf& m)
-{
-    int total_deviation;
-    int d;
-    int N = m.N;
-    int mean = (m.sum + (N/2)) / N;
-    for(size_t i=0; i<m.N; ++i)
-    {
-        d = m.buf[i] - mean;
-        if(d < 0) d = -d;
-        total_deviation += d;
-    }
-    return total_deviation;
-}
-
 void v23_demodulate(modemcfg& m) {
     FILE* out = (monit > 0) ? stderr : stdout;    // Output chars to stderr if we're monitoring
     framefmt& f = m.ff;
@@ -594,11 +575,6 @@ void v23_demodulate(modemcfg& m) {
                         if(debug > 1)
                             fprintf(stderr, "Dropping frame with high skew of %d\n", avg_skew);
                     }
-//                     else if(pnoise > ptotal)
-//                     {
-//                         if(debug > 1)
-//                             fprintf(stderr, "Dropping frame with high phase noise\n");
-//                     }
                     else
                     {
                         uint32_t frame_data = out_shift & ((1 << (f.frame_size+1)) - 1);
