@@ -444,8 +444,22 @@ void v23_demodulate(modemcfg& m) {
     if(!quiet)
         fprintf(stderr, "Initialized.  Processing samples.\n");
 
-    size_t n;     // Number of samples we have this time
-    int state=0;  // What was the last state
+    // Set the meaning of +ve / -ve phase change
+    // Note this will only change if the frequencies are adjusted
+    int phase_pos, phase_neg;
+    if(m.mark_freqhz > m.space_freqhz)
+    {
+        phase_pos = 0;
+        phase_neg = 1;
+    }
+    else    // v.23 frequencies are always like this...
+    {
+        phase_pos = 1;
+        phase_neg = 0;
+    }
+    
+    size_t n;       // Number of samples we have this time
+    int state=0;    // What was the last state
     bool line_idle = true;  // Are we in idle mode?
     while(n = get_input_samples(bufIn, N))
     {
@@ -477,7 +491,7 @@ void v23_demodulate(modemcfg& m) {
         for(size_t i=0; i<n; ++i)
         {
             last = state;
-            state = (bufOut[i] > 0) ? 1 : 0;
+            state = (bufOut[i] > 0) ? phase_pos : phase_neg;
             
             // Edge detected - re-align
             if(last != state) {
