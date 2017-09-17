@@ -392,7 +392,7 @@ void v23_demodulate(modemcfg& m) {
     int16_t *bufIn;
     int16_t *bufI, *bufQ;
     int16_t *bufAng;
-    int16_t *bufWork, *bufOut;
+    int16_t *bufWork, *bufOut, *bufTiming;
     
     int32_t out_shift = -1; // Raw serial shift-register
     int frame_hold = 50;    // How many bits to hold off for - preset to stabilize the MAFs
@@ -428,14 +428,15 @@ void v23_demodulate(modemcfg& m) {
         exit(1);
     }
     
-    bufIn    = make_buffer(N);
-    bufI     = make_buffer(N);
-    bufQ     = make_buffer(N);
-    bufAng   = make_buffer(N);
-    bufWork  = make_buffer(N);
-    bufOut   = make_buffer(N);
+    bufIn     = make_buffer(N);
+    bufI      = make_buffer(N);
+    bufQ      = make_buffer(N);
+    bufAng    = make_buffer(N);
+    bufWork   = make_buffer(N);
+    bufOut    = make_buffer(N);
+    bufTiming = make_buffer(N);
   
-    if(!( bufIn && bufI && bufQ && bufAng && bufWork  && bufOut))
+    if(!( bufIn && bufI && bufQ && bufAng && bufWork  && bufOut &&  bufTiming))
     {
         fprintf(stderr, "Failed to allocate buffers\n");
         exit(1);
@@ -476,26 +477,35 @@ void v23_demodulate(modemcfg& m) {
         deriv_samples(diffAng, bufAng, bufWork, n);
         maf_process(mafOut, bufWork, bufOut, n);
         
+        // Sign sampling and filtering to inform timing
+        sgn_samples(bufOut, bufWork, n);
+        maf_process(mafBit, bufWork, bufTiming, n, true);
+        
         if(monit > 0)
         {
-          int16_t *bufs[] = {bufIn, bufI, bufQ, bufAng, bufWork, bufOut};
+          int16_t *bufs[] = {bufIn, bufI, bufQ, bufAng, bufOut, bufTiming};
           output_multi(bufs, 6, n);
         }
-        
-        // Bit sampling
-        sgn_samples(bufOut, bufWork, n);
-        maf_process(mafBit, bufWork, bufOut, n, true);
         
         // Run through the output samples
         int last;
         for(size_t i=0; i<n; ++i)
         {
             last = state;
-            state = (bufOut[i] > 0) ? phase_pos : phase_neg;
+            state = (bufTiming[i] > 0) ? 1 : 0;
             
-            // Edge detected - re-align
+            // Edge detected in timing buffer - re-align
             if(last != state) {
-                int adj = (m.samples_per_bit / 2) - bit_wait;
+                int adj;
+                
+                // Which way?
+                if(bit_wait > (m.samples_per_bit / 2))
+                    // We are ahead (e.g. we just sampled)
+                    adj = m.samples_per_bit - bit_wait;
+                else
+                    // We are behind (e.g. we're about to sample)
+                    adj = -bit_wait;
+                
                 if(debug > 2)
                     fprintf(stderr, "Transition, skew: %d samples\n", adj);
                 
@@ -528,10 +538,11 @@ void v23_demodulate(modemcfg& m) {
             
             if(--bit_wait <= 0)
             {
+                int outbit = (bufOut[i] > 0) ? phase_pos : phase_neg;
                 if(debug > 3)
-                    fprintf(stderr, "Read bit '%d'\n", state);
+                    fprintf(stderr, "Read bit '%d'\n", outbit);
                 out_shift <<= 1;
-                out_shift += state;
+                out_shift += outbit;
                 
                 // If the shift register is all ones or all zeros, the line is idle
                 if(!line_idle && out_shift == -1 || out_shift == 0)
