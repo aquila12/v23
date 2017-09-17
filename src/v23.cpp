@@ -14,8 +14,10 @@
 #define F_BIT_RATE      1200
 #define B_BIT_RATE      75
 
-#define SKEW_LIMIT          0.4
+#define SKEW_LIMIT          0.2
 #define SKEW_CORRECT_FACTOR 3
+
+#define ERROR_LIMIT     3
 
 #define DEF_FRAME_FORMAT    "10dddddddp1"
 
@@ -394,8 +396,10 @@ void v23_demodulate(modemcfg& m) {
     int16_t *bufAng;
     int16_t *bufWork, *bufOut, *bufSign, *bufTiming;
     
+    int errcount=0;
+    int errtimeout=0;
     int32_t out_shift = -1; // Raw serial shift-register
-    int frame_hold = 50;    // How many bits to hold off for - preset to stabilize the MAFs
+    int frame_hold = f.frame_size;    // How many bits to hold off for
     
     // Quality monitoring
     int num_transitions = 0;
@@ -563,9 +567,6 @@ void v23_demodulate(modemcfg& m) {
                     int avg_skew = 0;   // We can't measure skew of a frame with no observed transitions
                     if(num_transitions > 0) avg_skew = total_skew / num_transitions;
                     
-                    int pnoise = estimate_phase_noise(mafOut);
-                    int ptotal = (mafOut.sum > 0) ? mafOut.sum : -mafOut.sum;
-                    
                     // Set line idle as we don't want to rehandle this frame
                     line_idle = true;
                     
@@ -574,6 +575,8 @@ void v23_demodulate(modemcfg& m) {
                     {
                         if(debug > 1)
                             fprintf(stderr, "Dropping frame with high skew of %d\n", avg_skew);
+                        ++errcount;
+                        errtimeout = 10*f.frame_size;
                     }
                     else
                     {
@@ -597,6 +600,8 @@ void v23_demodulate(modemcfg& m) {
                         // Parity check
                         if(!f.parity_enable || (data_parity == parity_bit))
                         {
+                            if(errcount > 0) --errcount;
+                            
                             // All OK
                             if(f.lsb_first)
                             {
@@ -610,17 +615,28 @@ void v23_demodulate(modemcfg& m) {
                             
                             data &= 0xff;
                             
-                            if(debug > 1)
-                                fprintf(stderr, "Got byte: 0x%02x\n", data);
-                            
-                            fprintf(out, "%c", (char)data );
-                            fflush(out);
+                            if(errcount < ERROR_LIMIT)
+                            {
+                                
+                                if(debug > 1)
+                                    fprintf(stderr, "Got byte: 0x%02x\n", data);
+                                
+                                fprintf(out, "%c", (char)data );
+                                fflush(out);
+                            }
+                            else
+                            {
+                                if(debug > 1)
+                                    fprintf(stderr, "Dropping apparently valid frame due to errors\n");
+                            }
                         }
                         else
                         {
                             if(debug > 1)
                                 fprintf(stderr, "Dropping frame with bad parity\n");
-                            if(m.errchar)
+                            ++errcount;
+                            errtimeout = 10*f.frame_size;
+                            if(errcount < ERROR_LIMIT && m.errchar)
                             {
                                 fprintf(out, "%c", m.errchar);
                                 fflush(out);
@@ -641,6 +657,8 @@ void v23_demodulate(modemcfg& m) {
                     total_skew = 0;
                     num_transitions = 0;
                     frame_hold = f.frame_size - 1;
+                    if(errtimeout > 0) --errtimeout;
+                    else errcount=0;
                 }
                 
                 bit_wait += m.samples_per_bit;
