@@ -10,10 +10,12 @@ If you want both, you'll need to run the program twice.
 The program is set up with good channel isolation, so you can run the forward and backward channels on one audio line without,
 for example, needing sidetone cancellation.
 
+`v23` is now able to use ALSA directly, so you don't need to pipe data around yourself.  There are no other audio backends.
+
 ## Basics
 By default, v23 either:
-* Reads audio data from STDIN (for demodulation) and writes characters to STDOUT, and messages to STDERR
-* Reads characters from STDIN (for modulation) and writes audio data to STDOUT, and messages to STDERR
+* Reads audio data from ALSA (for demodulation) and writes characters to STDOUT, and messages to STDERR
+* Reads characters from STDIN (for modulation) and writes audio data to ALSA, and messages to STDERR
 
 ## Command-line arguments
 Note the command-line interpretation is fairly dumb; each argument must be separate,
@@ -22,11 +24,11 @@ and any parameters must be specified without spaces in between.
 ### Default configuration
 The default configuration is equivalent to specifying:
 ```shell
-v23 -md -cb -r44100 -f10dddddddp1
+v23 -md -cb -r44100 -f10dddddddp1 -Ddefault -L100
 ```
 This means v23 will demodulate the backward channel, using a 44100Hz sample rate, and no character
 will be output when there is a parity error.  The frame format is equivalent to 7o1 - see below for
-a description of the frame specifier.
+a description of the frame specifier.  The ALSA "default" device is used, with a 100ms latency.
 
 Basic command-line options:
 * `-m` selects whether `v23` should modulate or demodulate a signal.  Use `-mm` to modulate, and `-md` to demodulate.
@@ -35,6 +37,8 @@ Basic command-line options:
 * `-q` increases quietness.  This disables some status messages.
 * `-r` overrides the default sample rate - e.g. use `-r48000` for 48kHz sampling.
 * `-f` overrides the default frame format.  See below for details.
+* `-D` overrides the ALSA audio device.
+* `-L` overrides the ALSA latency in ms.
 
 The following command-line options are understood by `v23` for _modulation only_:
 * `-A` specifies the amplitude of the output, in dB relative to full-scale.  Specify `-A6` for -6dB, for example.
@@ -71,20 +75,15 @@ If `v23` is put in monitor mode, the following things happen:
 * Raw 16-bit signed audio data is written to STDOUT.  It contains one channel per signal monitored (at present, 8).
 * Any demodulated data received is sent to STDERR (along with the usual messages).
 
-## Talking to a soundcard
-There's no audio API in the program, so you'll need to pipe the audio around yourself.
-On Linux, you can use the `alsa-utils` for this.
-
-`v23` uses signed 16-bit samples, and defaults to 44100Hz sampling rate - so set `aplay` or `arecord` accordingly.
-
+## Example usage
 For demodulation, use a command-line like:
 ```shell
-arecord -t raw -fS16 -c1 -r44100 | build/v23 -e'?' -f10dddddddP1
+build/v23 -e'?' -f10dddddddP1
 ```
 
 For modulation, use a command-line like:
 ```shell
-build/v23 -cf -mm -d -A6 -f10dddddddP1 | aplay -r44100 -c1 -fS16
+build/v23 -cf -mm -d -A6 -f10dddddddP1
 ```
 
 You'll almost certainly want to build a phone line injector or simulator to hook this up to, but you can just
@@ -92,7 +91,7 @@ connect audio leads for testing, or to talk to another softmodem at the far end.
 
 If you want to monitor the signals, use something like:
 ```shell
-arecord -t raw -fS16 -c1 -r44100 | build/v23 -e'?' -f10dddddddP1 -M > dump.raw
+build/v23 -e'?' -f10dddddddP1 -M > dump.raw
 ```
 
 The resulting raw audio can be imported into a tool such as Audacity.  The format is signed 16-bit little-endian, at the
