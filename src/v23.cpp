@@ -25,7 +25,8 @@
 
 #define DEF_FRAME_FORMAT    "10dddddddp1"
 
-#define DEF_AUDIO_DEVICE     "default"
+#define DEF_AUDIO_DEVICE    "default"
+#define DEF_AUDIO_LATENCY   100
 
 int quiet=0;
 int debug=0;
@@ -838,7 +839,8 @@ int main(int argc, char* argv[])
     const char *frame_format = DEF_FRAME_FORMAT;
     const char *audio_device = DEF_AUDIO_DEVICE;
     modemcfg modem;
-    unsigned int sample_rate = DEF_SAMPLE_RATE;
+    int sample_rate   = DEF_SAMPLE_RATE;
+    int audio_latency = DEF_AUDIO_LATENCY;
     float amplitude = 32767.0;  // Full-scale
     
     // Process args
@@ -906,6 +908,10 @@ int main(int argc, char* argv[])
                 case 'D':   // Audio device
                     audio_device = &arg[2];
                     break;
+                case 'L':   // Latency
+                    sscanf(&arg[2],"%d",&audio_latency);
+                    fprintf(stderr, "Set latency to %d ms\n", audio_latency);
+                    break;
                 default:
                     fprintf(stderr, "Unknown flag: %c\n", arg[1]);
                     exit(1);
@@ -918,7 +924,7 @@ int main(int argc, char* argv[])
     if(demodulate) amplitude = 32767.0;
     
     // Set up the audio device early - in case the sample rate is modified
-    if(!audioio_alsa_init(audio_device, sample_rate, demodulate ? 'r' : 'w'))
+    if(!audioio_alsa_init(audio_device, sample_rate, audio_latency, demodulate ? 'r' : 'w'))
     {
         fprintf(stderr, "Failed to open the audio device\n");
         exit(1);
