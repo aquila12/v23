@@ -5,6 +5,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#include <signal.h>
+
+#include "audioio_alsa.h"
+
 #define DEF_SAMPLE_RATE 44100
 #define F_MARK_FREQ     1300
 #define F_SPACE_FREQ    2100
@@ -17,13 +21,27 @@
 #define SKEW_LIMIT          0.2
 #define SKEW_CORRECT_FACTOR 3
 
-#define ERROR_LIMIT     3
+#define ERROR_LIMIT         3
 
 #define DEF_FRAME_FORMAT    "10dddddddp1"
+
+#define DEF_AUDIO_DEVICE     "default"
 
 int quiet=0;
 int debug=0;
 int monit=0;
+
+bool quit=false;
+
+void sig_handler(int s){
+    fprintf(stderr, "Caught signal %d\n",s);
+    switch(s)
+    {
+        case SIGINT:
+            quit=true;
+            break;
+    }
+}
 
 struct maf {
   int16_t *buf;
@@ -269,7 +287,25 @@ void ang_complex_samples(int16_t *samples_i, int16_t *samples_q,
 
 void output_buf(int16_t *samples_i, size_t n_samples)
 {
-  write(1, samples_i, n_samples * sizeof(int16_t));
+    size_t posn=0;
+    size_t left=n_samples;
+    size_t n;
+    
+    // Loop until it's all gone - or an error occurs
+    if(debug > 3)
+        fprintf(stderr, "Output %ld samples...\n", n_samples);
+    
+    while(left > 0)
+    {
+        n = audioio_alsa_putsamples(&samples_i[posn], left);
+        posn += n;
+        left -= n;
+        
+        if(debug > 3)
+            fprintf(stderr, "  Wrote %ld (%ld left)\n",n,left);
+        
+        if(n == 0) exit(1);
+    }
 }
 
 void output_multi(int16_t *buffers[], size_t n_bufs, size_t n_samples)
@@ -288,7 +324,11 @@ void output_multi(int16_t *buffers[], size_t n_bufs, size_t n_samples)
 }
 
 size_t get_input_samples(int16_t *buf, size_t n) {
-  return read(0, (char*)buf, n * sizeof(int16_t)) / sizeof(int16_t);
+    
+    size_t n_read = audioio_alsa_getsamples(buf, n);
+    if(n_read == 0) exit(1);
+    
+    return n_read;
 }
 
 // Parity of some data - returns true if an odd number of bits are set
@@ -467,9 +507,14 @@ void v23_demodulate(modemcfg& m) {
     size_t n;       // Number of samples we have this time
     int state=0;    // What was the last state
     bool line_idle = true;  // Are we in idle mode?
-    while(n = get_input_samples(bufIn, N))
+    while(!quit)
     {
-        //printf("Got %d of %d samples...\n", n, N);
+        n = get_input_samples(bufIn, N);
+        if(n == 0) break;
+        
+        if(debug > 3)
+            fprintf(stderr, "Got %ld samples (buffer size: %ld)\n", n, N);
+        
         // Mix and filter the local oscillator
         osc_get_complex_samples(o, bufI, bufQ, n);
         mul_samples(bufIn, bufI, bufWork, n);
@@ -582,7 +627,7 @@ void v23_demodulate(modemcfg& m) {
                     {
                         uint32_t frame_data = out_shift & ((1 << (f.frame_size+1)) - 1);
                         if(debug > 1)
-                            fprintf(stderr, "Processing frame: %llo, skew %d\n",
+                            fprintf(stderr, "Processing frame: %lo, skew %d\n",
                                     bin_as_octal(frame_data), avg_skew);
                         
                         bool parity_bit = (frame_data & f.parity_mask) != 0;
@@ -707,8 +752,7 @@ void v23_modulate(modemcfg& m) {
         exit(1);
     }
     
-    // Not ideal, but it's about what we want
-    while(true)
+    while(!quit)
     {
         // Time for another byte?
         if( bits_in_buffer < 1 )
@@ -751,7 +795,7 @@ void v23_modulate(modemcfg& m) {
                 bits_in_buffer = f.frame_size;
                 
                 if(debug > 1)
-                    fprintf(stderr, "Frame for input 0x%02x: %llo\n", (int)c_in, bin_as_octal(out_shift));
+                    fprintf(stderr, "Frame for input 0x%02x: %lo\n", (int)c_in, bin_as_octal(out_shift));
                 
                 // One last manipulation: shift the data to the top of the word
                 out_shift <<= (32 - f.frame_size);
@@ -792,8 +836,9 @@ int main(int argc, char* argv[])
     bool forward = false;
     char errchar = 0;           // No output for errors
     const char *frame_format = DEF_FRAME_FORMAT;
+    const char *audio_device = DEF_AUDIO_DEVICE;
     modemcfg modem;
-    int sample_rate = DEF_SAMPLE_RATE;
+    unsigned int sample_rate = DEF_SAMPLE_RATE;
     float amplitude = 32767.0;  // Full-scale
     
     // Process args
@@ -858,6 +903,9 @@ int main(int argc, char* argv[])
                 case 'M':   // Monitor mode
                     ++monit;
                     break;
+                case 'D':   // Audio device
+                    audio_device = &arg[2];
+                    break;
                 default:
                     fprintf(stderr, "Unknown flag: %c\n", arg[1]);
                     exit(1);
@@ -868,6 +916,13 @@ int main(int argc, char* argv[])
     
     // Demodulation expects the amplitude to be set to this!
     if(demodulate) amplitude = 32767.0;
+    
+    // Set up the audio device early - in case the sample rate is modified
+    if(!audioio_alsa_init(audio_device, sample_rate, demodulate ? 'r' : 'w'))
+    {
+        fprintf(stderr, "Failed to open the audio device\n");
+        exit(1);
+    }
     
     // Set up a the sine buffer
     if(!sin_init(amplitude, sample_rate)) {
@@ -901,13 +956,23 @@ int main(int argc, char* argv[])
         fprintf(stderr, "Data size:       %d, %s first, with %s parity\n",
                 ff.data_size, ff.lsb_first ? "lsb":"msb",
                 ff.parity_enable ? (ff.parity_even ? "even" : "odd" ) : "no");
+        fprintf(stderr, "Sample rate:     %d Hz\n", sample_rate);
     }
+    
+    struct sigaction sigIntHandler;
+
+    sigIntHandler.sa_handler = sig_handler;
+    sigemptyset(&sigIntHandler.sa_mask);
+    sigIntHandler.sa_flags = 0;
+
+    sigaction(SIGINT, &sigIntHandler, NULL);
     
     if(demodulate)
         v23_demodulate(modem);
     else
         v23_modulate(modem);
-  
+    
+    audioio_alsa_stop();
     
     free(sinebuf);
     
